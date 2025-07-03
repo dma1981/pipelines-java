@@ -4,19 +4,143 @@
 # https://docs.microsoft.com/azure/devops/pipelines/languages/java
 
 trigger:
-- main
+- main # Or the branch you work on for your solution
 
-pool:
-  vmImage: ubuntu-latest
+variables:
+  solutionName: 'OfficeSignInandOut'
+  # **IMPORTANT: Replace with the actual unique name (schema name) of your solution, NOT the display name. Find this in Power Apps > Solutions > click on your solution > Overview tab.**
+  buildConfiguration: 'release' # or 'debug'
+  buildPlatform: 'any cpu'
+  # Define a path for unpacked solution components
+  solutionUnpackedFolder: '$(Build.SourcesDirectory)/$(solutionName)_unpacked'
 
-steps:
-- task: Maven@4
-  inputs:
-    mavenPomFile: 'pom.xml'
-    mavenOptions: '-Xmx3072m'
-    javaHomeOption: 'JDKVersion'
-    jdkVersionOption: '1.11'
-    jdkArchitectureOption: 'x64'
-    publishJUnitResults: true
-    testResultsFiles: '**/surefire-reports/TEST-*.xml'
-    goals: 'package'
+
+# Define stages
+stages:
+- stage: BuildJava
+  displayName: 'Build Java Project'
+  jobs:
+  - job: JavaBuildJob
+    displayName: 'Maven Build'
+    pool:
+      vmImage: ubuntu-latest # Your Java build runs on Ubuntu
+
+    steps:
+    - task: Maven@4
+      inputs:
+        mavenPomFile: 'pom.xml'
+        mavenOptions: '-Xmx3072m'
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '1.11'
+        jdkArchitectureOption: 'x64'
+        publishJUnitResults: true
+        testResultsFiles: '**/surefire-reports/TEST-*.xml'
+        goals: 'package'
+
+    # You might want to publish Java artifacts here too
+    # - publish: '$(Build.ArtifactStagingDirectory)'
+    #   artifact: 'JavaApp'
+
+- stage: BuildAndDeployPowerPlatform
+  displayName: 'Build and Deploy Power Platform Solution'
+  dependsOn: BuildJava # This stage will run after BuildJava completes successfully
+  condition: succeeded() # Only run if the BuildJava stage succeeded
+  jobs:
+  - job: DeployPowerPlatform
+    displayName: 'Deploy Power Platform Solution'
+    pool:
+      vmImage: 'windows-latest' # Power Platform Build Tools generally run on Windows
+
+    steps:
+    - checkout: self # Ensure your repository is checked out in this job as well
+
+    # 1. Install Power Platform Build Tools
+    # This task must be added once before any other Power Platform Build Tools tasks in this job.
+    # It automatically installs the latest compatible version of the Power Platform CLI (PAC CLI).
+    - task: PowerPlatformToolInstaller@2
+      displayName: 'Install Power Platform Tools'
+      # No 'inputs' for 'version' are needed here, as it installs the latest automatically.
+
+    # 2. Export Solution from Development Environment
+    # This exports the UNMANAGED solution from your dev environment.
+    - task: PowerPlatformExportSolution@2
+      displayName: 'Export Unmanaged Solution from Dev'
+      inputs:
+        authenticationType: 'PowerPlatformSPN' # Using Service Principal
+        PowerPlatformSPN: 'PowerPlatform-DonnaAtkins-Dev-Env' # **Your Dev environment service connection name**
+        SolutionName: '$(solutionName)'
+        SolutionOutputfile: '$(Build.ArtifactStagingDirectory)\$(solutionName).zip'
+        Managed: false # Export as unmanaged
+        # Removed AsyncWait and MaxWaitTime as they caused errors in your environment.
+        # The task will run synchronously and use its default timeout.
+
+    # **Corrected Step:** Unpack the solution
+    # This is necessary because PowerPlatformPackSolution@2 often expects a source folder, not a zip,
+    # when you want to explicitly define the output (like Managed type).
+    - task: PowerPlatformUnpackSolution@2
+      displayName: 'Unpack Solution for Packing'
+      inputs:
+        SolutionInputFile: '$(Build.ArtifactStagingDirectory)\$(solutionName).zip'
+        SolutionTargetFolder: '$(solutionUnpackedFolder)' # **Corrected from SolutionOutputFolder**
+
+    # 3. Pack Solution (to create a managed solution for deployment)
+    # This now takes the UNPACKED solution components from a folder and packs it into a MANAGED solution ZIP.
+    - task: PowerPlatformPackSolution@2
+      displayName: 'Pack Solution as Managed'
+      inputs:
+        SolutionSourceFolder: '$(solutionUnpackedFolder)' # Now using SolutionSourceFolder
+        SolutionOutputFile: '$(Build.ArtifactStagingDirectory)\$(solutionName)_managed.zip'
+        SolutionType: 'Managed' # Pack as managed for deployment
+        # Removed SolutionVersion as it caused an error in your environment.
+
+    # 4. Publish Build Artifacts
+    # Makes the managed solution ZIP file available for release stages or subsequent jobs/stages.
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Solution Artifact'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'drop' # The name of the artifact, used to download it later
+        publishLocation: 'Container' # Publish to the pipeline's artifact store
+
+- stage: DeployToTest
+  displayName: 'Deploy to Test Environment'
+  dependsOn: BuildAndDeployPowerPlatform # This stage runs after the Power Platform Build stage
+  condition: succeeded() # Only run if the previous stage succeeded
+  jobs:
+  - job: DeployJob
+    displayName: 'Import Solution to Test'
+    pool:
+      vmImage: 'windows-latest' # This job also needs a Windows agent
+
+    steps:
+    # 1. Install Power Platform Build Tools (again, for this job, as jobs run on fresh agents)
+    - task: PowerPlatformToolInstaller@2
+      displayName: 'Install Power Platform Tools'
+      # No 'inputs' for 'version' needed here either.
+
+    # 2. Download the Solution Artifact
+    # Downloads the 'drop' artifact published by the previous stage.
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Solution Artifact'
+      inputs:
+        artifactName: 'drop' # Must match the ArtifactName used in PublishBuildArtifacts
+        # The default pathtoPublish is $(Pipeline.Workspace), which is suitable.
+
+    # 3. Import Solution to Test Environment
+    # Imports the managed solution into your test Power Platform environment.
+    - task: PowerPlatformImportSolution@2
+      displayName: 'Import Managed Solution to Test'
+      inputs:
+        authenticationType: 'PowerPlatformSPN'
+        PowerPlatformSPN: 'PowerPlatform-UAT-Test-Env' # **Your Test environment service connection name**
+        SolutionInputFile: '$(Pipeline.Workspace)/drop/$(solutionName)_managed.zip' # Path to the downloaded managed solution
+        PublishWorkflows: true # Activates workflows after import
+        # Removed ActivateWorkflows, AsyncWait, and MaxWaitTime as they caused errors in your environment.
+
+    # 4. (Optional) Publish Customizations
+    # Good practice after import to ensure all changes are applied and visible.
+    - task: PowerPlatformPublishCustomizations@2
+      displayName: 'Publish Customizations in Test'
+      inputs:
+        authenticationType: 'PowerPlatformSPN'
+        PowerPlatformSPN: 'PowerPlatform-UAT-Test-Env' # **Your Test environment service connection name**
